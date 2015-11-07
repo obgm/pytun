@@ -12,6 +12,8 @@
 #include <net/ethernet.h>
 #include <linux/if_tun.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netdb.h>
 
 #ifndef PyVarObject_HEAD_INIT
 #define PyVarObject_HEAD_INIT(type, size) \
@@ -37,6 +39,13 @@ static void raise_error_from_errno(void)
     PyErr_SetFromErrno(pytun_error);
 }
 
+struct in6_ifreq
+{
+    struct in6_addr ifr6_addr;
+    __u32 ifr6_prefixlen;
+    unsigned int ifr6_ifindex;
+};
+
 static int if_ioctl(int cmd, struct ifreq* req)
 {
     int ret;
@@ -44,6 +53,33 @@ static int if_ioctl(int cmd, struct ifreq* req)
 
     Py_BEGIN_ALLOW_THREADS
     sock = socket(AF_INET, SOCK_DGRAM, 0);
+    Py_END_ALLOW_THREADS
+    if (sock < 0)
+    {
+        raise_error_from_errno();
+        return -1;
+    }
+    Py_BEGIN_ALLOW_THREADS
+    ret = ioctl(sock, cmd, req);
+    Py_END_ALLOW_THREADS
+    if (ret < 0)
+    {
+        raise_error_from_errno();
+    }
+    Py_BEGIN_ALLOW_THREADS
+    close(sock);
+    Py_END_ALLOW_THREADS
+
+    return ret;
+}
+
+static int if_ioctl6(int cmd, struct in6_ifreq* req)
+{
+    int ret;
+    int sock;
+
+    Py_BEGIN_ALLOW_THREADS
+    sock = socket(AF_INET6, SOCK_DGRAM, 0);
     Py_END_ALLOW_THREADS
     if (sock < 0)
     {
@@ -217,6 +253,47 @@ static PyObject* pytun_tuntap_get_addr(PyObject* self, void* d)
 #endif
 }
 
+static int pytun_tuntap_resolve_addr(const char *server, struct sockaddr *dst)
+{
+    struct addrinfo *res, *ainfo;
+    struct addrinfo hints;
+    static char addrstr[256];
+    int error, len=-1;
+
+    memset(addrstr, 0, sizeof(addrstr));
+    memcpy(addrstr, server, strlen(server));
+
+    memset ((char *)&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_family = AF_UNSPEC;
+
+    error = getaddrinfo(addrstr, NULL, &hints, &res);
+
+    if (error != 0)
+    {
+        return error;
+    }
+
+    memset(dst, 0, sizeof(struct sockaddr));
+    for (ainfo = res; ainfo != NULL; ainfo = ainfo->ai_next)
+    {
+        switch (ainfo->ai_family)
+        {
+        case AF_INET6:
+        case AF_INET:
+            len = ainfo->ai_addrlen;
+            memcpy(dst, ainfo->ai_addr, len);
+            goto finish;
+        default:
+            ;
+        }
+    }
+
+ finish:
+    freeaddrinfo(res);
+    return len;
+}
+
 static int pytun_tuntap_set_addr(PyObject* self, PyObject* value, void* d)
 {
     pytun_tuntap_t* tuntap = (pytun_tuntap_t*)self;
@@ -226,7 +303,16 @@ static int pytun_tuntap_set_addr(PyObject* self, PyObject* value, void* d)
     PyObject* tmp_addr;
 #endif
     const char* addr;
-    struct sockaddr_in* sin;
+    char addrbuf[INET6_ADDRSTRLEN+1];
+    const char* pprefix;
+    long int prefix_len = -1;
+    union
+    {
+        struct sockaddr         sa;
+        struct sockaddr_storage st;
+        struct sockaddr_in      sin;
+        struct sockaddr_in6     sin6;
+    } saddr;
 
 #if PY_MAJOR_VERSION >= 3
     tmp_addr = PyUnicode_AsASCIIString(value);
@@ -239,18 +325,78 @@ static int pytun_tuntap_set_addr(PyObject* self, PyObject* value, void* d)
         ret = -1;
         goto out;
     }
-    memset(&req, 0, sizeof(req));
-    strcpy(req.ifr_name, tuntap->name);
-    sin = (struct sockaddr_in*)&req.ifr_addr;
-    sin->sin_family = AF_INET;
-    if (inet_aton(addr, &sin->sin_addr) == 0)
+
+    /* split addr from prefix length if given */
+    pprefix = strchr(addr, '/');
+    if (pprefix != NULL)
+    {
+        const size_t addr_length = pprefix - addr;
+        char *endptr;
+
+        memcpy(addrbuf, addr, addr_length);
+        addrbuf[addr_length] = 0;
+        addr = addrbuf;
+
+        prefix_len = strtol(pprefix + 1, &endptr, 10);
+
+        if (*endptr != '\0' || endptr == pprefix + 1)
+        {
+            raise_error("Bad prefix length specifier");
+            ret = -1;
+            goto out;
+        }
+    }
+
+    if (pytun_tuntap_resolve_addr(addr, &saddr.sa) < 0)
     {
         raise_error("Bad IP address");
         ret = -1;
         goto out;
     }
-    if (if_ioctl(SIOCSIFADDR, &req) < 0)
+
+    switch (saddr.sa.sa_family)
     {
+    case PF_INET:
+        {
+            memset(&req, 0, sizeof(req));
+            strcpy(req.ifr_name, tuntap->name);
+            memcpy(&req.ifr_addr, &saddr.sin, sizeof(struct sockaddr_in));
+            if (if_ioctl(SIOCSIFADDR, &req) < 0)
+            {
+                raise_error("cannot set address 1");
+                ret = -1;
+                goto out;
+            }
+            break;
+        }
+    case PF_INET6:
+        {
+            struct in6_ifreq ifr6;
+
+            memset(&req, 0, sizeof(req));
+            strncpy(req.ifr_name, tuntap->name, IFNAMSIZ);
+            memcpy(&ifr6.ifr6_addr, &saddr.sin6.sin6_addr, sizeof(struct in6_addr));
+
+            if (if_ioctl(SIOGIFINDEX, &req) < 0)
+            {
+                raise_error("cannot get interface index");
+                ret = -1;
+                goto out;
+            }
+
+            ifr6.ifr6_ifindex = req.ifr_ifindex;
+            ifr6.ifr6_prefixlen = prefix_len < 0 ? 64 : prefix_len;
+
+            if (if_ioctl6(SIOCSIFADDR, &ifr6) < 0)
+            {
+                raise_error("cannot set address 2");
+                ret = -1;
+                goto out;
+            }
+            break;
+        }
+    default:
+        raise_error("unsupported address format");
         ret = -1;
         goto out;
     }
